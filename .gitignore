@@ -1,0 +1,13 @@
+*.elf
+*.bin
+*.o
+*.a
+cmake_install.cmake
+.ninja_*
+build.ninja
+CMakeCache.txt
+CMakeFiles/
+.cmake/
+.idea/
+Testing/
+build/
