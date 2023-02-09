@@ -38,6 +38,7 @@ const char CMD_DUMP_ABS[] = "dump_abs";
 const char CMD_DUMP_BASE[] = "dump_base";
 const char CMD_DUMP_VADDR[] = "dump_vaddr";
 const char CMD_DUMP_PADDR[] = "dump_paddr";
+const char CMD_DUMP_RANGES[] = "dump_ranges";
 const char CMD_STOP[] = "stop";
 
 #define CMD_IS(x) \
@@ -205,6 +206,117 @@ ssize_t vaddr_to_paddr(size_t vaddr, size_t dmap_base, size_t cr3,
   return -ERR_VADDR_NO_LEAF;
 }
 
+struct vaddr_paddr_range {
+  size_t vaddr_begin, vaddr_end;
+  size_t paddr_begin, paddr_end;
+  size_t pte_flags;
+};
+
+struct vaddr_paddr_ranges {
+  struct vaddr_paddr_range *ranges;
+  size_t len;
+  size_t cap;
+};
+
+const size_t PTE_FLAGS_MASK =
+    (PDE_RW_MASK << PDE_RW) |
+    (PDE_USER_MASK << PDE_USER) |
+    (PDE_WRITE_THROUGH_MASK << PDE_WRITE_THROUGH) |
+    (PDE_CACHE_DISABLE_MASK << PDE_CACHE_DISABLE) |
+    (PDE_GLOBAL_MASK << PDE_GLOBAL) |
+    (PDE_EXECUTE_DISABLE_MASK << PDE_EXECUTE_DISABLE) |
+    (PDE_PROTECTION_KEY_MASK << PDE_PROTECTION_KEY);
+
+ssize_t append_range(size_t vaddr, size_t paddr, size_t size, size_t pte,
+                     struct vaddr_paddr_ranges *ranges) {
+  if (ranges->len + 1 > ranges->cap) {
+    struct vaddr_paddr_range *old_ranges = ranges->ranges;
+    size_t old_cap = ranges->cap;
+    ranges->cap = ranges->cap ? ranges->cap * 2 : 8096;
+    ranges->ranges = malloc(ranges->cap * sizeof(struct vaddr_paddr_range));
+    if (ranges->ranges == NULL) {
+      if (old_ranges != NULL) {
+        free(old_ranges);
+      }
+      return -ranges->cap;
+    }
+    if (old_ranges != NULL) {
+      memcpy(ranges->ranges, old_ranges,
+             old_cap * sizeof(struct vaddr_paddr_range));
+      free(old_ranges);
+    }
+  }
+  struct vaddr_paddr_range new_range = {.vaddr_begin = vaddr,
+                                        .vaddr_end = vaddr + size,
+                                        .paddr_begin = paddr,
+                                        .paddr_end = paddr + size,
+                                        .pte_flags = pte & PTE_FLAGS_MASK};
+  struct vaddr_paddr_range *old_range =
+      ranges->len > 0 ? &ranges->ranges[ranges->len - 1] : NULL;
+  if (old_range && old_range->vaddr_end == new_range.vaddr_begin &&
+      old_range->paddr_end == new_range.paddr_begin &&
+      old_range->pte_flags == new_range.pte_flags) {
+    old_range->vaddr_end = new_range.vaddr_end;
+    old_range->paddr_end = new_range.paddr_end;
+  } else {
+    ranges->ranges[ranges->len++] = new_range;
+  }
+  return 0;
+}
+
+const size_t SIGN_EXT_MASK = 0xffff000000000000;
+
+ssize_t collect_ranges(size_t dmap_base, size_t paddr, size_t vaddr,
+                       size_t level_idx, struct vaddr_paddr_ranges *ranges) {
+  ssize_t ret = 0;
+  uint64_t pd[512];
+  const struct page_level *level;
+
+  level = LEVELS + level_idx;
+  kernel_copyout(PADDR_TO_DMAP(paddr), &pd, sizeof(pd));
+  for (size_t idx = 0; idx < 512; ++idx) {
+    uint64_t pde = pd[idx];
+    size_t next_paddr = pde & PDE_ADDR_MASK;
+    size_t next_vaddr = vaddr | (idx << level->from);
+    if (level->sign_ext && ((idx >> (level->to - level->from)) & 1)) {
+      next_vaddr |= SIGN_EXT_MASK;
+    }
+
+    size_t leaf = level->leaf || PDE_FIELD(pde, PS);
+
+    if (!PDE_FIELD(pde, PRESENT)) {
+      continue;
+    }
+
+    if (leaf) {
+      ret = append_range(next_vaddr, next_paddr, level->size, pde, ranges);
+    } else {
+      ret = collect_ranges(dmap_base, next_paddr, next_vaddr, level_idx + 1,
+                           ranges);
+    }
+    if (ret < 0) {
+      return ret;
+    }
+  }
+  return ret;
+}
+
+void print_ranges(struct vaddr_paddr_ranges *ranges, int sock) {
+  char printbuf[256];
+  for (size_t i = 0; i < ranges->len; ++i) {
+    struct vaddr_paddr_range *range = &ranges->ranges[i];
+    size_t pde = range->pte_flags;
+    sprintf(printbuf,
+            "[%p, %p) -> [%p, %p), rw %p, x %p, user %p, glob %p, pk %p, wt %p, cd %p\n",
+            range->vaddr_begin, range->vaddr_end, range->paddr_begin,
+            range->paddr_end, PDE_FIELD(pde, RW),
+            !PDE_FIELD(pde, EXECUTE_DISABLE), PDE_FIELD(pde, USER),
+            PDE_FIELD(pde, GLOBAL), PDE_FIELD(pde, PROTECTION_KEY),
+            PDE_FIELD(pde, WRITE_THROUGH), PDE_FIELD(pde, CACHE_DISABLE));
+    sock_print(sock, printbuf);
+  }
+}
+
 int payload_main(struct payload_args *args) {
   int exit_code = 0;
   int ret;
@@ -220,6 +332,7 @@ int payload_main(struct payload_args *args) {
   ssize_t pmap_offset = -1;
   struct flat_pmap kernel_pmap_store;
   size_t dmap_base = 0;
+  struct vaddr_paddr_ranges mem_ranges = {.ranges = NULL, .cap = 0, .len = 0};
 
   kdata_base = args->kdata_base_addr;
 
@@ -356,6 +469,16 @@ int payload_main(struct payload_args *args) {
         ret = sscanf(cmd_buf + sizeof(CMD_DUMP_VADDR), "0x%zx 0x%zx",
                      &dump_address, &dump_size);
         vaddr_to_paddr_mode = 1;
+      } else if (CMD_IS(CMD_DUMP_RANGES)) {
+        mem_ranges.len = 0;
+        ret = collect_ranges(dmap_base, kernel_pmap_store.pm_cr3, 0, 0,
+                             &mem_ranges);
+        sprintf(printbuf, "%d\n", ret < 0 ? ret : mem_ranges.len);
+        sock_print(client, printbuf);
+        if (ret == 0) {
+          print_ranges(&mem_ranges, client);
+        }
+        goto client_close;
       } else {
         goto client_close;
       }

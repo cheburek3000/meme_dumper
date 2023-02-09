@@ -18,6 +18,7 @@ With this idea in mind, this tool will run a server, which will dump you almost 
 ## Commands
 - `dump_vaddr 0x{vaddr} 0x{size}` - resolve virtual address to physical and ask kernel to dump `{size}` bytes from physical memory.
 - `dump_paddr 0x{paddr} 0x{size}` - dump `{size}` bytes from physical memory from physical address.
+- `dump_ranges` - dump all mapping from virtual memory to physical in human readable format.
 - `stop` - stop the server, for example, to deploy another ELF.
 
 ## Not so useful commands
