@@ -151,7 +151,7 @@ const size_t PDE_EXECUTE_DISABLE_MASK = 1;
 
 #define PDE_FIELD(pde, name) (((pde) >> PDE_##name) & PDE_##name##_MASK)
 
-const size_t PDE_ADDR_MASK = 0xffffffffff800ULL;  // bits [12, 51]
+const size_t PDE_ADDR_MASK = 0xffffffffff000ULL;  // bits [12, 51]
 
 #define PADDR_TO_DMAP(paddr) ((paddr) + dmap_base)
 
